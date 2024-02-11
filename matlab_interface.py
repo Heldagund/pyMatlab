@@ -8,12 +8,12 @@ except NameError:
     pass
 
 import os
+import sys
 from io import StringIO
 from textwrap import dedent
 import argparse
 from time import sleep
-import re
-# import sys
+from helper import *
 
 global import_fail
 try: # Check if the Matlab Engine is installed
@@ -40,12 +40,15 @@ frames = [
 ]
 
 # For running script (sr: script runner)
-initiators = ['if', 'while', 'for', 'switch']
+initiators = ['if', 'while', 'for', 'switch', 'function']
 terminators = ['else', 'elseif', 'end', 'case', 'otherwise']
 sr_parser = argparse.ArgumentParser()
 sr_parser.add_argument("script", help="path of the script to run")
-sr_parser.add_argument("-i", "--interactive", help="Activate this option if your script has pause",
-                    action="store_true")
+sr_parser.add_argument("-i", "--interactive", 
+                       help='''Run the script with pre-intepretation.\n
+                               Activate this option if your script has pause''',
+                       action="store_true")
+sr_parser.add_argument("-d", "--debug", help="Debug the script", action="store_true")
 
 class MatlabInterface:
     global import_fail
@@ -84,8 +87,7 @@ class MatlabInterface:
                 self.clear()
                 print("MATLAB Engine for Python exited prematurely.")
                 print(e)
-                # TODO: test if this line is necessary
-                # sys.exit()
+                sys.exit()
 
         else:
             print("Launching MATLAB failed: Error starting MATLAB process in MATLAB Engine for Python.")
@@ -106,9 +108,12 @@ class MatlabInterface:
         try:
             stream = StringIO()
             err_stream = StringIO()
-            if output == True:
+            if output:
                 self.eng.eval(line, nargout=0, stdout=stream, stderr=err_stream)
-                return stream.getvalue()
+                output = stream.getvalue()
+                if output:
+                    print(output)
+                return True
             else:
                 return self.eng.eval(line, nargout=1, stdout=stream, stderr=err_stream)
                 
@@ -118,9 +123,11 @@ class MatlabInterface:
             print("Restarting MATLAB Engine for Python...")
             self.eng = matlab.engine.start_matlab()
             print("Restarted MATLAB process.")
+            return False
 
         except : # The other exceptions are handled by Matlab
             print(stream.getvalue(), err_stream.getvalue(), sep="\n")
+            return False
 
     def run_script(self, script_path):
         if not import_fail:
@@ -144,17 +151,17 @@ class MatlabInterface:
 
 ######################### Experimental feature #########################
     def process_input(self, line) -> bool:
-        # No screen output with or without a semicolon following the command
+        # There will be screen output with or without a semicolon following the command
         try:
             [name, expr] = line.split('=', 1)
         except ValueError:
-            # The input value is not assigned to a variable (WHO WILL DO THIS!) 
+            # The input value is not assigned to a variable (WHO WILL DO THIS!)
+            # return True
             name = None
             expr = line
 
         # Extract input arguments
-        p = re.compile(r'[(](.*)[)]') 
-        args = re.findall(p, expr)[0].split(',')
+        args = extArgsInRdBrac(expr)
         if not args:
             print('Not enough arguments for the input command')
             return False
@@ -163,7 +170,7 @@ class MatlabInterface:
         prompt = eval(args[0])
         user_input = input(prompt)
 
-        # Assign the input value to a variable
+        # Assign the input value to the variable
         if name:
             if len(args) > 1:
                 if args[1].find('s') != -1:
@@ -181,17 +188,26 @@ class MatlabInterface:
             dbg_cmd = input().strip()
             if dbg_cmd == 'exit':
                 return False
-            if dbg_cmd == 'step':
+            elif dbg_cmd == 'step':
                 break
-            if dbg_cmd == 'continue':
-                self.debug_mode = False
+            elif dbg_cmd == 'continue' or dbg_cmd == 'c':
+                self.debug_pause = False
                 break
-            if dbg_cmd == 'watch':
+            elif dbg_cmd.startswith('watch'):
                 vars = self.run_line('who', output = False)
-                if vars:
+                if not vars:
+                    print('There is no variable in the workspace')
+                    continue
+                try:
+                    var = dbg_cmd.split()[1]
+                    if var in vars:
+                        self.run_line(var)
+                    else:
+                        print('No variable named {}'.format(var))
+                except IndexError:
                     for var in vars:
                         # To make the output more readable
-                        print(self.run_line(var))
+                        self.run_line(var)
                         # print('{}: {}'.format(var, self.eng.workspace[var]))  
         return True
         
@@ -204,8 +220,8 @@ class MatlabInterface:
                 line = f.readline()
                 continue
 
-            if self.debug_mode:
-                print('Stop at line:\n    ', line)
+            if self.debug_mode and self.debug_pause:
+                print('Stop at line {}:\n-> {}'.format(f.cur_idx, line))
                 if not self.debug_loop(f):
                     return False
                 line = line.replace('dbg', '')
@@ -213,51 +229,53 @@ class MatlabInterface:
             first_word = line.split()[0]
             if first_word == 'if':
                 if not self.run_if_block(f, line.lstrip('if')):
-                    print('Error occurred around line:\n    ', line)
+                    print('Error occurred around line {}:\n    {}'.format(f.cur_idx, line))
                     return False
             elif first_word == 'while':
                 if not self.run_while_block(f, line.lstrip('while')):
-                    print('Error occurred around line:\n    ', line)
+                    print('Error occurred around line {}:\n    {}'.format(f.cur_idx, line))
                     return False
             elif first_word == 'for':
                 if not self.run_for_block(f, line.lstrip('for')):
-                    print('Error occurred around line:\n    ', line)
+                    print('Error occurred around line {}:\n    {}'.format(f.cur_idx, line))
                     return False
             elif first_word == 'switch':
                 if not self.run_switch_block(f, line.lstrip('switch')):
-                    print('Error occurred around line:\n    ', line)
+                    print('Error occurred around line {}:\n    {}'.format(f.cur_idx, line))
                     return False
+            elif first_word == 'function':
+                f.seek(self.get_keyword_pos(f, 'end'))
+
             elif first_word in terminators:
                 break
+            
             else:
                 if line.endswith('dbg'):
-                    self.debug_mode = True
+                    line = line.rstrip('dbg')
+                    self.debug_pause = self.debug_mode
                     continue
 
                 elif line.find('input(') != -1:
                     if not self.process_input(line):
-                        print('Error occurred around line:\n    ', f.readline())
+                        print('Error occurred around line {}:\n    {}'.format(f.cur_idx, line))
                         return False
 
                 elif line.find('pause') != -1 :
                     line = line.replace('pause', '')
                     output = self.run_line(line)
-                    if output:
-                        print(output)
                     input()
 
                 else:
                     output = self.run_line(line)
-                    if output:
-                        print(output)
+
             line = f.readline()
         return True
     
     def get_keyword_pos(self, f, key: str, pos_max: int = -1) -> int:
         init_pos = f.tell()
-        # if key == 'end' and init_pos in self.pos_cache:
-        #     print('cache hit')
-        #     return self.pos_cache[init_pos]
+        if key == 'end' and init_pos in self.pos_cache:
+            # print('cache hit')
+            return self.pos_cache[init_pos]
         found = False
         key_pos = init_pos
         line = f.readline()
@@ -268,9 +286,14 @@ class MatlabInterface:
                 first_word = line.lstrip().split()[0]
                 if first_word in initiators:
                     key_pos = self.get_keyword_pos(f, 'end', pos_max)
-                    if key_pos == -1:
-                        print('Syntax error: the end of nested {} block is missing!'.format(first_word))
-                        return -1
+                    if key_pos < 0:
+                        print('Syntax error: the end of if block is missing!')
+                        print('Error occurred around line {}:\n    {}'.format(f.cur_idx, line))
+                        f.seek(init_pos)
+                        return -2
+                    if first_word == 'function':
+                        signature = line.strip().split(' ', 1)[1]
+                        self.func_cache[f.tell()] = key_pos
                     f.seek(key_pos)
                     f.readline()
                 # 'elseif' is considered the same as 'else'
@@ -284,18 +307,16 @@ class MatlabInterface:
             line = f.readline()
         f.seek(init_pos)
         if found:
-            # if key == 'end':
-            #     print('cache store')
-            #     self.pos_cache[init_pos] = key_pos
+            if key == 'end':
+                # print('cache store')
+                self.pos_cache[init_pos] = key_pos
             return key_pos
         else:
             return -1
         
     def run_if_block(self, f, condition: str) -> bool:
         pos_end = self.get_keyword_pos(f, 'end')
-        if pos_end == -1:
-            print('Syntax error: the end of if block is missing!')
-            return False
+
         if self.run_line(condition, output = False):
             # 1st case
             # if True
@@ -354,9 +375,6 @@ class MatlabInterface:
     def run_while_block(self, f, condition: str):
         pos_begin = f.tell()
         pos_end = self.get_keyword_pos(f, 'end')
-        if pos_end == -1:
-            print('Syntax error: the end of while block is missing!')
-            return False
 
         while self.run_line(condition, output = False):
             if not self.run_sequential(f):
@@ -377,9 +395,6 @@ class MatlabInterface:
         loop_var = get_loop_variable(expr)
         pos_begin = f.tell()
         pos_end = self.get_keyword_pos(f, 'end')
-        if pos_end == -1:
-            print('Syntax error: the end of for block is missing!')
-            return False
         
         for i in loop_var['range']:
             self.eng.workspace[loop_var['name']] = i
@@ -396,9 +411,6 @@ class MatlabInterface:
             return self.run_line('{}=={}'.format(swtich_expr, case_expr), output = False)
         
         pos_end = self.get_keyword_pos(f, 'end')
-        if pos_end == -1:
-            print('Syntax error: the end of switch block is missing!')
-            return False
         pos_otherwise = self.get_keyword_pos(f, 'otherwise', pos_end)
         done = False
 
@@ -429,24 +441,27 @@ class MatlabInterface:
     
     def run_interactive_script(self, script_path):
         if not import_fail:
-            # Create a cache to store the pairs of the block initiator
-            # position and their corresponding end position in the script
-            # 
-            # It is useful for nested blocks but not so necessary as we don't
-            # usually create complexe structures when writing Matlab script
+            # Scan the entire script to create a cache which store the pairs of 
+            # postions for all block initiators and their corresponding ends
             # 
             # The cache action is done in get_keyword_pos
-            # self.pos_cache = {}
-            self.debug_mode = False
+            self.pos_cache = {}
+            self.func_cache = {}
+            script_root = self.run_line('pwd', output = False)
+            os.chdir(script_root)
             print("File: \"{}\"".format(script_path))
             # Exexcute line by line
             try:
-                with open(script_path) as s:
-                    self.run_sequential(s)
+                with openIndexedFile(script_path) as s:
+                    # We strip each line before match it with the keyword, 
+                    # so we can be sure to reach the end of the file by searching space 
+                    if self.get_keyword_pos(s, ' ') != -2:
+                        self.run_sequential(s)
             except FileNotFoundError:
                 print("File is not found!")
             # Clear the cache
-            # self.pos_cache.clear()
+            self.pos_cache.clear()
+            self.func_cache.clear()
 
 #######################################################################################
 
@@ -485,8 +500,7 @@ class MatlabInterface:
     #             os.rmdir(os.path.dirname(temp_path))
 
     def interactive_loop(self):
-        loop=True # Looping allows for an interactive terminal
-        # mode = InterfaceMode.COMMAND_WINDOW
+        loop = True # Looping allows for an interactive terminal
 
         while loop and not import_fail:
             print('>>> ', end='')
@@ -497,22 +511,24 @@ class MatlabInterface:
             if not cmd_tokens:
                 continue
             
-            if cmd_tokens[0]=="exit" or cmd_tokens[0]=="exit()": # Keywords to leave the engine
+            if cmd_tokens[0] == 'exit' or cmd_tokens[0] == 'exit()': # Keywords to leave the engine
                 loop=False
 
-            elif cmd_tokens[0]=="clc" or cmd_tokens[0]=="clc()": # matlab terminal clearing must be reimplemented
+            elif cmd_tokens[0] == 'clc' or cmd_tokens[0] == 'clc()': # matlab terminal clearing must be reimplemented
                 self.clear()
-
+                
             else:
                 if cmd_tokens[0].endswith('.m'):
                     # script runner mode
-                    args = sr_parser.parse_args(command.split())
-                    if args.interactive:
+                    args = sr_parser.parse_args(cmd_tokens)
+                    self.debug_mode = args.debug
+                    self.debug_pause = False
+                    if self.debug_mode:
+                        self.run_interactive_script(args.script)
+                    elif args.interactive:
                         self.run_interactive_script(args.script)
                     else:
                         self.run_script(args.script)
                 else:
                     # command window mode
                     output = self.run_line(command)
-                    if output:
-                        print(output)
