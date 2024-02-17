@@ -104,6 +104,9 @@ class MatlabInterface:
         res = self.eng.eval(release_str)
         return res
 
+    def scan_line(self, line: str):
+        pass
+    
     def run_line(self, line: str, output = True):
         try:
             stream = StringIO()
